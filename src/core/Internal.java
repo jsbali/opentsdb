@@ -802,15 +802,12 @@ public final class Internal {
   public static byte[] buildQualifier(final long timestamp, final short flags) {
     final long base_time;
     if ((timestamp & Const.SECOND_MASK) != 0) {
-      // drop the ms timestamp to seconds to calculate the base timestamp
-      base_time = ((timestamp / 1000) - ((timestamp / 1000) 
-          % Const.MAX_TIMESPAN));
-      final int qual = (int) (((timestamp - (base_time * 1000) 
+        final int qual = (int) ((((timestamp % 1000 + (((timestamp / 1000)
+              % Const.MAX_TIMESPAN) * 1000))
           << (Const.MS_FLAG_BITS)) | flags) | Const.MS_FLAG);
       return Bytes.fromInt(qual);
     } else {
-      base_time = (timestamp - (timestamp % Const.MAX_TIMESPAN));
-      final short qual = (short) ((timestamp - base_time) << Const.FLAG_BITS
+      final short qual = (short) ((timestamp % Const.MAX_TIMESPAN) << Const.FLAG_BITS
           | flags);
       return Bytes.fromShort(qual);
     }
