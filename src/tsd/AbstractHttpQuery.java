@@ -23,6 +23,7 @@ import com.google.common.base.Objects;
 import com.stumbleupon.async.Deferred;
 
 import org.jboss.netty.buffer.ChannelBuffer;
+import org.jboss.netty.buffer.ChannelBuffers;
 import org.jboss.netty.channel.Channel;
 import org.jboss.netty.channel.ChannelFuture;
 import org.jboss.netty.channel.ChannelFutureListener;
@@ -36,6 +37,7 @@ import org.jboss.netty.handler.codec.http.QueryStringDecoder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import net.opentsdb.core.Const;
 import net.opentsdb.core.TSDB;
 import net.opentsdb.stats.QueryStats;
 
@@ -113,7 +115,7 @@ public abstract class AbstractHttpQuery {
     return chan;
   }
 
-  /** @return The remote address and port in the format <ip>:<port> */
+  /** @return The remote address and port in the format &lt;ip&gt;:&lt;port&gt; */
   public String getRemoteAddress() {
     return chan.getRemoteAddress().toString();
   }
@@ -126,8 +128,8 @@ public abstract class AbstractHttpQuery {
    */
   public Map<String, String> getPrintableHeaders() {
     final Map<String, String> headers = new HashMap<String, String>(
-        request.getHeaders().size());
-    for (final Entry<String, String> header : request.getHeaders()) {
+        request.headers().entries().size());
+    for (final Entry<String, String> header : request.headers().entries()) {
       if (header.getKey().toLowerCase().equals("cookie")) {
         // null out the cookies
         headers.put(header.getKey(), "*******");
@@ -152,8 +154,8 @@ public abstract class AbstractHttpQuery {
    */
   public Map<String, String> getHeaders() {
     final Map<String, String> headers = new HashMap<String, String>(
-        request.getHeaders().size());
-    for (final Entry<String, String> header : request.getHeaders()) {
+        request.headers().entries().size());
+    for (final Entry<String, String> header : request.headers().entries()) {
       // http://tools.ietf.org/html/rfc2616#section-4.2
       if (headers.containsKey(header.getKey())) {
         headers.put(header.getKey(), 
@@ -164,6 +166,16 @@ public abstract class AbstractHttpQuery {
     }
     return headers;
   }
+  
+  /**
+   * Return the value of the given HTTP Header
+   * first match wins
+   * @return Header value as string
+   */
+   public String getHeaderValue(final String headerName) {
+     if (headerName == null) { return null; }
+     return request.headers().get(headerName);
+   }
   
   /** @param stats The stats object to mark after writing is complete */
   public void setStats(final QueryStats stats) {
@@ -360,7 +372,10 @@ public abstract class AbstractHttpQuery {
    */
   public void internalError(final Exception cause) {
     logError("Internal Server Error on " + request().getUri(), cause);
-    sendStatusOnly(HttpResponseStatus.INTERNAL_SERVER_ERROR);
+    sendBuffer(HttpResponseStatus.INTERNAL_SERVER_ERROR,
+        ChannelBuffers.wrappedBuffer(
+            cause.toString().getBytes(Const.UTF8_CHARSET)),
+        "text/plain");
   }
 
   /**
@@ -369,7 +384,10 @@ public abstract class AbstractHttpQuery {
    */
   public void badRequest(final BadRequestException exception) {
     logWarn("Bad Request on " + request().getUri() + ": " + exception.getMessage());
-    sendStatusOnly(HttpResponseStatus.BAD_REQUEST);
+    sendBuffer(HttpResponseStatus.BAD_REQUEST,
+        ChannelBuffers.wrappedBuffer(
+            exception.toString().getBytes(Const.UTF8_CHARSET)),
+        "text/plain");
   }
 
   /**
@@ -477,16 +495,17 @@ public abstract class AbstractHttpQuery {
   }
 
   protected final String logChannel() {
-    if (request.containsHeader("X-Forwarded-For")) {
+    if (request.headers().contains("X-Forwarded-For")) {
         String inetAddress;
-        String proxyChain = request.getHeader("X-Forwarded-For");
+        String proxyChain = request.headers().get("X-Forwarded-For");
         int firstComma = proxyChain.indexOf(',');
         if (firstComma != -1) {
           inetAddress = proxyChain.substring(0, proxyChain.indexOf(','));
         } else {
           inetAddress = proxyChain;
         }
-        return "[id: 0x" + Integer.toHexString(chan.hashCode()) + ", /" + inetAddress + " => " + chan.getLocalAddress() + ']';
+        return "[id: 0x" + Integer.toHexString(chan.hashCode()) 
+          + ", /" + inetAddress + " => " + chan.getLocalAddress() + ']';
     } else {
         return chan.toString();
     }

@@ -48,6 +48,7 @@ import net.opentsdb.graph.Plot;
 import net.opentsdb.meta.Annotation;
 import net.opentsdb.stats.Histogram;
 import net.opentsdb.stats.StatsCollector;
+import net.opentsdb.tools.GnuplotInstaller;
 import net.opentsdb.utils.DateTime;
 import net.opentsdb.utils.JSON;
 
@@ -179,6 +180,15 @@ final class GraphHandler implements HttpRpc {
     } else if (options.size() != tsdbqueries.length) {
       throw new BadRequestException(options.size() + " `o' parameters, but "
         + tsdbqueries.length + " `m' parameters.");
+    } else {
+      for (final String option : options) {
+        // TODO - far from perfect, should help a little.
+        if (option.contains("`") || option.contains("%60") || 
+            option.contains("&#96;")) {
+          throw new BadRequestException("Option contained a back-tick. "
+              + "That's a no-no.");
+        }
+      }
     }
     for (final Query tsdbquery : tsdbqueries) {
       try {
@@ -627,6 +637,12 @@ final class GraphHandler implements HttpRpc {
   static void setPlotDimensions(final HttpQuery query, final Plot plot) {
     final String wxh = query.getQueryStringParam("wxh");
     if (wxh != null && !wxh.isEmpty()) {
+      // TODO - far from perfect, should help a little.
+      if (wxh.contains("`") || wxh.contains("%60") || 
+          wxh.contains("&#96;")) {
+        throw new BadRequestException("WXH contained a back-tick. "
+            + "That's a no-no.");
+      }
       final int wxhlength = wxh.length();
       if (wxhlength < 7) {  // 100x100 minimum.
         throw new BadRequestException("Parameter wxh too short: " + wxh);
@@ -677,7 +693,14 @@ final class GraphHandler implements HttpRpc {
     if (params == null) {
       return null;
     }
-    return params.get(params.size() - 1);
+    final String given = params.get(params.size() - 1);
+    // TODO - far from perfect, should help a little.
+    if (given.contains("`") || given.contains("%60") || 
+        given.contains("&#96;")) {
+      throw new BadRequestException("Parameter " + param + " contained a "
+          + "back-tick. That's a no-no.");
+    }
+    return given;
   }
 
   /**
@@ -908,6 +931,18 @@ final class GraphHandler implements HttpRpc {
    * @return The path to the wrapper script.
    */
   private static String findGnuplotHelperScript() {
+    if(!GnuplotInstaller.FOUND_GP) {
+      LOG.warn("Skipping Gnuplot Shell Script Install since Gnuplot executable was not found");
+      return null;
+    }
+    if(!GnuplotInstaller.GP_FILE.exists()) {
+      GnuplotInstaller.installMyGnuPlot();
+    }
+    if(GnuplotInstaller.GP_FILE.exists() && GnuplotInstaller.GP_FILE.canExecute()) {
+      LOG.info("Auto Installed Gnuplot Invoker at [{}]", GnuplotInstaller.GP_FILE.getAbsolutePath());
+      return GnuplotInstaller.GP_FILE.getAbsolutePath();
+    }
+    
     final URL url = GraphHandler.class.getClassLoader().getResource(WRAPPER);
     if (url == null) {
       throw new RuntimeException("Couldn't find " + WRAPPER + " on the"

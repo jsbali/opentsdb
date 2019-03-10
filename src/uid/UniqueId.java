@@ -26,6 +26,9 @@ import java.util.concurrent.ConcurrentHashMap;
 
 import javax.xml.bind.DatatypeConverter;
 
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.cache.Cache;
+import com.google.common.cache.CacheBuilder;
 import com.stumbleupon.async.Callback;
 import com.stumbleupon.async.Deferred;
 
@@ -45,6 +48,7 @@ import org.slf4j.LoggerFactory;
 import net.opentsdb.core.Const;
 import net.opentsdb.core.Internal;
 import net.opentsdb.core.TSDB;
+import net.opentsdb.core.TSDB.OperationMode;
 import net.opentsdb.meta.UIDMeta;
 
 /**
@@ -98,12 +102,17 @@ public final class UniqueId implements UniqueIdInterface {
   private final boolean randomize_id;
 
   /** Cache for forward mappings (name to ID). */
-  private final ConcurrentHashMap<String, byte[]> name_cache =
-    new ConcurrentHashMap<String, byte[]>();
+  private final ConcurrentHashMap<String, byte[]> name_cache;
   /** Cache for backward mappings (ID to name).
    * The ID in the key is a byte[] converted to a String to be Comparable. */
-  private final ConcurrentHashMap<String, String> id_cache =
-    new ConcurrentHashMap<String, String>();
+  private final ConcurrentHashMap<String, String> id_cache;
+  
+  /** Cache for forward mappings (name to ID). */
+  private final Cache<String, byte[]> lru_name_cache;
+  /** Cache for backward mappings (ID to name).
+   * The ID in the key is a byte[] converted to a String to be Comparable. */
+  private final Cache<String, String> lru_id_cache;
+  
   /** Map of pending UID assignments */
   private final HashMap<String, Deferred<byte[]>> pending_assignments =
     new HashMap<String, Deferred<byte[]>>();
@@ -112,14 +121,23 @@ public final class UniqueId implements UniqueIdInterface {
     Collections.synchronizedSet(new HashSet<String>());
 
   /** Number of times we avoided reading from HBase thanks to the cache. */
-  private volatile int cache_hits;
+  private volatile long cache_hits;
   /** Number of times we had to read from HBase and populate the cache. */
-  private volatile int cache_misses;
+  private volatile long cache_misses;
   /** How many times we collided with an existing ID when attempting to 
    * generate a new UID */
   private volatile int random_id_collisions;
   /** How many times assignments have been rejected by the UID filter */
   private volatile int rejected_assignments;
+  
+  /** The mode of operation for this TSD. */
+  private OperationMode mode;
+  
+  /** Whether or not to use the mode for caching IDs. */
+  private boolean use_mode;
+  
+  /** Whether or not to use the Guava LRU cache for IDs. */
+  private boolean use_lru;
   
   /** TSDB object used for filtering and/or meta generation. */
   private TSDB tsdb;
@@ -144,7 +162,7 @@ public final class UniqueId implements UniqueIdInterface {
    * @param table The name of the HBase table to use.
    * @param kind The kind of Unique ID this instance will deal with.
    * @param width The number of bytes on which Unique IDs should be encoded.
-   * @param Whether or not to randomize new UIDs
+   * @param randomize_id Whether or not to randomize new UIDs
    * @throws IllegalArgumentException if width is negative or too small/large
    * or if kind is an empty string.
    * @since 2.2
@@ -163,6 +181,12 @@ public final class UniqueId implements UniqueIdInterface {
     }
     this.id_width = (short) width;
     this.randomize_id = randomize_id;
+    mode = OperationMode.READWRITE;
+    name_cache = new ConcurrentHashMap<String, byte[]>();
+    id_cache = new ConcurrentHashMap<String, String>();
+    lru_name_cache = null;
+    lru_id_cache = null;
+    use_lru = false;
   }
   
   /**
@@ -171,7 +195,7 @@ public final class UniqueId implements UniqueIdInterface {
    * @param table The name of the HBase table to use.
    * @param kind The kind of Unique ID this instance will deal with.
    * @param width The number of bytes on which Unique IDs should be encoded.
-   * @param Whether or not to randomize new UIDs
+   * @param randomize_id Whether or not to randomize new UIDs
    * @throws IllegalArgumentException if width is negative or too small/large
    * or if kind is an empty string.
    * @since 2.3
@@ -191,23 +215,68 @@ public final class UniqueId implements UniqueIdInterface {
     }
     this.id_width = (short) width;
     this.randomize_id = randomize_id;
+    mode = tsdb.getMode();
+    use_mode = tsdb.getConfig().getBoolean("tsd.uid.use_mode");
+    use_lru = tsdb.getConfig().getBoolean("tsd.uid.lru.enable");
+    if (use_lru) {
+      name_cache = null;
+      id_cache = null;
+      lru_name_cache = CacheBuilder.newBuilder()
+          .maximumSize(tsdb.getConfig().getInt("tsd.uid.lru.name.size"))
+          .build();
+      lru_id_cache = CacheBuilder.newBuilder()
+          .maximumSize(tsdb.getConfig().getInt("tsd.uid.lru.id.size"))
+          .build();
+    } else {
+      name_cache = new ConcurrentHashMap<String, byte[]>();
+      id_cache = new ConcurrentHashMap<String, String>();
+      lru_name_cache = null;
+      lru_id_cache = null;
+    }
   }
 
   /** The number of times we avoided reading from HBase thanks to the cache. */
-  public int cacheHits() {
+  public long cacheHits() {
     return cache_hits;
   }
 
   /** The number of times we had to read from HBase and populate the cache. */
-  public int cacheMisses() {
+  public long cacheMisses() {
     return cache_misses;
   }
 
   /** Returns the number of elements stored in the internal cache. */
-  public int cacheSize() {
+  public long cacheSize() {
+    if (use_lru) {
+      return (int) (lru_name_cache.size() + lru_id_cache.size());
+    }
     return name_cache.size() + id_cache.size();
   }
 
+  /**
+   * Resets the cache hits counter before rollover. Note that a few updates
+   * may be dropped due to race conditions at rollover.
+   */
+  private void incrementCacheHits() {
+    if (cache_hits >= Long.MAX_VALUE) {
+      cache_hits = 1;
+    } else {
+      cache_hits++;
+    }
+  }
+  
+  /**
+   * Resets the cache miss counter before rollover. Note that a few updates
+   * may be dropped due to race conditions at rollover.
+   */
+  private void incrementCacheMiss() {
+    if (cache_misses >= Long.MAX_VALUE) {
+      cache_misses = 1;
+    } else {
+      cache_misses++;
+    }
+  }
+  
   /** Returns the number of random UID collisions */
   public int randomIdCollisions() {
     return random_id_collisions;
@@ -229,11 +298,13 @@ public final class UniqueId implements UniqueIdInterface {
   /** @param tsdb Whether or not to track new UIDMeta objects */
   public void setTSDB(final TSDB tsdb) {
     this.tsdb = tsdb;
+    mode = tsdb.getMode();
+    use_mode = tsdb.getConfig().getBoolean("tsd.uid.use_mode");
   }
   
   /** The largest possible ID given the number of bytes the IDs are 
    * represented on.
-   * @deprecated Use {@link Internal.getMaxUnsignedValueOnBytes}
+   * @deprecated Use {@link Internal#getMaxUnsignedValueOnBytes(int)}
    */
   public long maxPossibleId() {
     return Internal.getMaxUnsignedValueOnBytes(id_width);
@@ -244,8 +315,13 @@ public final class UniqueId implements UniqueIdInterface {
    * @since 1.1
    */
   public void dropCaches() {
-    name_cache.clear();
-    id_cache.clear();
+    if (use_lru) {
+      lru_name_cache.invalidateAll();
+      lru_id_cache.invalidateAll();
+    } else {
+      name_cache.clear();
+      id_cache.clear();
+    }
   }
 
   /**
@@ -291,17 +367,30 @@ public final class UniqueId implements UniqueIdInterface {
     }
     final String name = getNameFromCache(id);
     if (name != null) {
-      cache_hits++;
+      incrementCacheHits();
       return Deferred.fromResult(name);
     }
-    cache_misses++;
+    incrementCacheMiss();
     class GetNameCB implements Callback<String, String> {
       public String call(final String name) {
         if (name == null) {
           throw new NoSuchUniqueId(kind(), id);
         }
-        addNameToCache(id, name);
-        addIdToCache(name, id);        
+        if (use_mode) {
+          switch(mode) {
+          case READONLY:
+            addNameToCache(id, name);
+            break;
+          case WRITEONLY:
+            break;
+          default:
+            addNameToCache(id, name);
+            addIdToCache(name, id);
+          }
+        } else {
+          addNameToCache(id, name);
+          addIdToCache(name, id);
+        }
         return name;
       }
     }
@@ -309,7 +398,8 @@ public final class UniqueId implements UniqueIdInterface {
   }
 
   private String getNameFromCache(final byte[] id) {
-    return id_cache.get(fromBytes(id));
+    return use_lru ? lru_id_cache.getIfPresent(fromBytes(id)) : 
+                     id_cache.get(fromBytes(id));
   }
 
   private Deferred<String> getNameFromHBase(final byte[] id) {
@@ -323,9 +413,13 @@ public final class UniqueId implements UniqueIdInterface {
 
   private void addNameToCache(final byte[] id, final String name) {
     final String key = fromBytes(id);
-    String found = id_cache.get(key);
+    String found = use_lru ? lru_id_cache.getIfPresent(key) : id_cache.get(key);
     if (found == null) {
-      found = id_cache.putIfAbsent(key, name);
+      if (use_lru) {
+        lru_id_cache.put(key, name);
+      } else {
+        found = id_cache.putIfAbsent(key, name);
+      }
     }
     if (found != null && !found.equals(name)) {
       throw new IllegalStateException("id=" + Arrays.toString(id) + " => name="
@@ -346,10 +440,10 @@ public final class UniqueId implements UniqueIdInterface {
   public Deferred<byte[]> getIdAsync(final String name) {
     final byte[] id = getIdFromCache(name);
     if (id != null) {
-      cache_hits++;
+      incrementCacheHits();
       return Deferred.fromResult(id);
     }
-    cache_misses++;
+    incrementCacheMiss();
     class GetIdCB implements Callback<byte[], byte[]> {
       public byte[] call(final byte[] id) {
         if (id == null) {
@@ -360,8 +454,21 @@ public final class UniqueId implements UniqueIdInterface {
                                           + " which is != " + id_width
                                           + " required for '" + kind() + '\'');
         }
-        addIdToCache(name, id);
-        addNameToCache(id, name);
+        if (use_mode) {
+          switch(mode) {
+          case READONLY:
+            break;
+          case WRITEONLY:
+            addIdToCache(name, id);
+            break;
+          default:
+            addNameToCache(id, name);
+            addIdToCache(name, id);
+          }
+        } else {
+          addIdToCache(name, id);
+          addNameToCache(id, name);
+        }
         return id;
       }
     }
@@ -370,7 +477,7 @@ public final class UniqueId implements UniqueIdInterface {
   }
 
   private byte[] getIdFromCache(final String name) {
-    return name_cache.get(name);
+    return use_lru ? lru_name_cache.getIfPresent(name) : name_cache.get(name);
   }
 
   private Deferred<byte[]> getIdFromHBase(final String name) {
@@ -378,13 +485,18 @@ public final class UniqueId implements UniqueIdInterface {
   }
 
   private void addIdToCache(final String name, final byte[] id) {
-    byte[] found = name_cache.get(name);
+    byte[] found = use_lru ? lru_name_cache.getIfPresent(name) : 
+                             name_cache.get(name);
     if (found == null) {
-      found = name_cache.putIfAbsent(name,
-                                    // Must make a defensive copy to be immune
-                                    // to any changes the caller may do on the
-                                    // array later on.
-                                    Arrays.copyOf(id, id.length));
+      if (use_lru) {
+        lru_name_cache.put(name, Arrays.copyOf(id, id.length));
+      } else {
+        found = name_cache.putIfAbsent(name,
+                                      // Must make a defensive copy to be immune
+                                      // to any changes the caller may do on the
+                                      // array later on.
+                                      Arrays.copyOf(id, id.length));
+      }
     }
     if (found != null && !Arrays.equals(found, id)) {
       throw new IllegalStateException("name=" + name + " => id="
@@ -773,7 +885,7 @@ public final class UniqueId implements UniqueIdInterface {
     // Look in the cache first.
     final byte[] id = getIdFromCache(name);
     if (id != null) {
-      cache_hits++;
+      incrementCacheHits();
       return Deferred.fromResult(id);
     }
     // Not found in our cache, so look in HBase instead.
@@ -939,7 +1051,8 @@ public final class UniqueId implements UniqueIdInterface {
         final byte[] key = row.get(0).key();
         final String name = fromBytes(key);
         final byte[] id = row.get(0).value();
-        final byte[] cached_id = name_cache.get(name);
+        final byte[] cached_id = use_lru ? lru_name_cache.getIfPresent(name) : 
+                                           name_cache.get(name);
         if (cached_id == null) {
           cacheMapping(name, id); 
         } else if (!Arrays.equals(id, cached_id)) {
@@ -1042,8 +1155,13 @@ public final class UniqueId implements UniqueIdInterface {
 
     // Update cache.
     addIdToCache(newname, row);            // add     new name -> ID
-    id_cache.put(fromBytes(row), newname);  // update  ID -> new name
-    name_cache.remove(oldname);             // remove  old name -> ID
+    if (use_lru) {
+      lru_id_cache.put(fromBytes(row), newname);
+      lru_name_cache.invalidate(oldname);
+    } else {
+      id_cache.put(fromBytes(row), newname);  // update  ID -> new name
+      name_cache.remove(oldname);             // remove  old name -> ID
+    }
 
     // Delete the old forward mapping.
     try {
@@ -1103,8 +1221,13 @@ public final class UniqueId implements UniqueIdInterface {
     class ErrCB implements Callback<Object, Exception> {
       @Override
       public Object call(final Exception ex) throws Exception {
-        name_cache.remove(name);
-        id_cache.remove(fromBytes(uid));
+        if (use_lru) {
+          lru_name_cache.invalidate(name);
+          lru_id_cache.invalidate(fromBytes(uid));
+        } else {
+          name_cache.remove(name);
+          id_cache.remove(fromBytes(uid));
+        }
         LOG.error("Failed to delete " + fromBytes(kind) + " UID " + name 
             + " but still cleared the cache", ex);
         return ex;
@@ -1116,8 +1239,13 @@ public final class UniqueId implements UniqueIdInterface {
       @Override
       public Deferred<Object> call(final ArrayList<Object> response) 
           throws Exception {
-        name_cache.remove(name);
-        id_cache.remove(fromBytes(uid));
+        if (use_lru) {
+          lru_name_cache.invalidate(name);
+          lru_id_cache.invalidate(fromBytes(uid));
+        } else {
+          name_cache.remove(name);
+          id_cache.remove(fromBytes(uid));
+        }
         LOG.info("Successfully deleted " + fromBytes(kind) + " UID " + name);
         return Deferred.fromResult(null);
       }
@@ -1146,7 +1274,8 @@ public final class UniqueId implements UniqueIdInterface {
       }
     }
     
-    final byte[] cached_uid = name_cache.get(name);
+    final byte[] cached_uid = use_lru ? lru_name_cache.getIfPresent(name) : 
+                                        name_cache.get(name);
     if (cached_uid == null) {
       return getIdFromHBase(name).addCallbackDeferring(new LookupCB())
           .addErrback(new ErrCB());
@@ -1623,7 +1752,7 @@ public final class UniqueId implements UniqueIdInterface {
    * @param uid_cache_map A map of {@link UniqueId} objects keyed on the kind.
    * @throws HBaseException Passes any HBaseException from HBase scanner.
    * @throws RuntimeException Wraps any non HBaseException from HBase scanner.
-   * @2.1
+   * @since 2.1
    */
   public static void preloadUidCache(final TSDB tsdb,
       final ByteMap<UniqueId> uid_cache_map) throws HBaseException {
@@ -1663,8 +1792,10 @@ public final class UniqueId implements UniqueIdInterface {
       for (UniqueId unique_id_table : uid_cache_map.values()) {
         LOG.info("After preloading, uid cache '{}' has {} ids and {} names.",
                  unique_id_table.kind(),
-                 unique_id_table.id_cache.size(),
-                 unique_id_table.name_cache.size());
+                 unique_id_table.use_lru ? unique_id_table.lru_id_cache.size() : 
+                                           unique_id_table.id_cache.size(),
+                 unique_id_table.use_lru ? unique_id_table.lru_name_cache.size() : 
+                                           unique_id_table.name_cache.size());
       }
     } catch (Exception e) {
       if (e instanceof HBaseException) {
@@ -1679,5 +1810,25 @@ public final class UniqueId implements UniqueIdInterface {
         scanner.close();
       }
     }
+  }
+
+  @VisibleForTesting
+  Map<String, byte[]> nameCache() {
+    return name_cache;
+  }
+  
+  @VisibleForTesting
+  Map<String, String> idCache() {
+    return id_cache;
+  }
+  
+  @VisibleForTesting
+  Cache<String, byte[]> lruNameCache() {
+    return lru_name_cache;
+  }
+  
+  @VisibleForTesting
+  Cache<String, String> lruIdCache() {
+    return lru_id_cache;
   }
 }

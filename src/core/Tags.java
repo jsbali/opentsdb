@@ -19,6 +19,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
+import com.stumbleupon.async.DeferredGroupException;
+import net.opentsdb.utils.Exceptions;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -353,7 +355,7 @@ public final class Tags {
    * Extracts the value ID of the given tag UD name from the given row key.
    * @param tsdb The TSDB instance to use for UniqueId lookups.
    * @param row The row key in which to search the tag name.
-   * @param name The name of the tag to search in the row key.
+   * @param tag_id The name of the tag to search in the row key.
    * @return The value ID associated with the given tag ID, or null if this
    * tag ID isn't present in this row key.
    */
@@ -404,7 +406,14 @@ public final class Tags {
                                      final byte[] row) throws NoSuchUniqueId {
     try {
       return getTagsAsync(tsdb, row).joinUninterruptibly();
-    } catch (RuntimeException e) {
+    } catch (DeferredGroupException e) {
+      final Throwable ex = Exceptions.getCause(e);
+      if (ex instanceof NoSuchUniqueId) {
+        throw (NoSuchUniqueId)ex;
+      }
+
+      throw new RuntimeException("Should never be here", e);
+    }  catch (RuntimeException e) {
       throw e;
     } catch (Exception e) {
       throw new RuntimeException("Should never be here", e);
@@ -419,7 +428,7 @@ public final class Tags {
    * @throws NoSuchUniqueId if the row key contained an invalid ID (unlikely).
    * @since 1.2
    */
-  static Deferred<Map<String, String>> getTagsAsync(final TSDB tsdb,
+  public static Deferred<Map<String, String>> getTagsAsync(final TSDB tsdb,
                                      final byte[] row) throws NoSuchUniqueId {
     final short name_width = tsdb.tag_names.width();
     final short value_width = tsdb.tag_values.width();
@@ -734,6 +743,14 @@ public final class Tags {
       return resolveIdsAsync(tsdb, tags).joinUninterruptibly();
     } catch (NoSuchUniqueId e) {
       throw e;
+    } catch (DeferredGroupException e) {
+      final Throwable ex = Exceptions.getCause(e);
+      if (ex instanceof NoSuchUniqueId) {
+        throw (NoSuchUniqueId)ex;
+      }
+      // TODO  process e.results()
+
+      throw new RuntimeException("Shouldn't be here", e);
     } catch (Exception e) {
       throw new RuntimeException("Shouldn't be here", e);
     }
@@ -824,5 +841,19 @@ public final class Tags {
    */
   static boolean isAllowSpecialChars(char character) {
     return allowSpecialChars.indexOf(character) != -1;
+  }
+
+  /**
+   * Returns true if the given string can fit into a float.
+   * @param value The String holding the float value.
+   * @return true if the value can fit into a float, false otherwise.
+   * @throws NumberFormatException if the value is not numeric.
+   * @since 2.4
+   */
+  public static boolean fitsInFloat(final String value) {
+    // TODO - probably still a better way to do this and we could save a lot
+    // of space by dropping useless precision, but for now this should help. 
+    final double d = Double.parseDouble(value);
+    return ((float) d) == d;
   }
 }
